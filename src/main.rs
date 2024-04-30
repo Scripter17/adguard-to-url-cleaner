@@ -62,7 +62,7 @@ impl TryFrom<RemoveParam> for Mapper {
     
     fn try_from(value: RemoveParam) -> Result<Self, <Self as TryFrom<RemoveParam>>::Error> {
         Ok(match value {
-            RemoveParam::RegexParts(regex_parts) => Self::RemoveQueryParamsMatching(StringMatcher::Regex(regex_parts.try_into()?)),
+            RemoveParam::RegexParts(regex_parts) => Self::RemoveQueryParamsMatching(StringMatcher::Regex(regex_parts.into())),
             RemoveParam::String(string) => Self::RemoveQueryParams([string].into_iter().collect())
         })
     }
@@ -97,8 +97,8 @@ fn domain_glob_to_condition(explicitly_unqualified: bool, domain: &str) -> Condi
     match (explicitly_unqualified, &domain.split('.').collect::<Vec<_>>()[..]) {
         (_    , ["*", ref segments @ .., "*"]) | (true , [ref segments @ .., "*"]) if !segments.contains(&"*") => Condition::UnqualifiedAnyTld(domain.strip_suffix(".*").unwrap().to_string()),
         (false, [     ref segments @ .., "*"])                                     if !segments.contains(&"*") => Condition::QualifiedAnyTld  (domain.strip_suffix(".*").unwrap().to_string()),
-        (true ,       ref segments           )                                     if !segments.contains(&"*") => Condition::UnqualifiedDomain(domain.to_string()),
-        (false,       ref segments           )                                     if !segments.contains(&"*") => Condition::QualifiedDomain  (domain.to_string()),
+        (true ,           segments           )                                     if !segments.contains(&"*") => Condition::UnqualifiedDomain(domain.to_string()),
+        (false,           segments           )                                     if !segments.contains(&"*") => Condition::QualifiedDomain  (domain.to_string()),
         _ => todo!()
     }
 }
@@ -108,11 +108,11 @@ fn path_glob_to_condition(path: &str) -> Condition {
     match path.split('/').skip(1).collect::<Vec<_>>()[..] {
         ["*"] => Condition::Not(Box::new(Condition::PathIs("/".into()))),
         ref x => {
-            Condition::All(x.into_iter().enumerate().map(|(i, segment)| match segment.chars().collect::<Vec<_>>()[..] {
+            Condition::All(x.iter().enumerate().map(|(i, segment)| match segment.chars().collect::<Vec<_>>()[..] {
                 ['*'] => Condition::Not(Box::new(Condition::PartIs{part: UrlPart::PathSegment(i as isize), value: None})),
-                ['*', ref x @ ..     ] if !x.contains(&'*') => Condition::PartContains{part: UrlPart::PathSegment(i as isize), r#where: StringLocation::End  , value:      x.into_iter().collect::<String>().into()} ,
-                [     ref x @ .., '*'] if !x.contains(&'*') => Condition::PartContains{part: UrlPart::PathSegment(i as isize), r#where: StringLocation::Start, value:      x.into_iter().collect::<String>().into()} ,
-                      ref x            if !x.contains(&'*') => Condition::PartIs      {part: UrlPart::PathSegment(i as isize),                                 value: Some(x.into_iter().collect::<String>().into())},
+                ['*', ref x @ ..     ] if !x.contains(&'*') => Condition::PartContains{part: UrlPart::PathSegment(i as isize), r#where: StringLocation::End  , value:      x.iter().collect::<String>().into()} ,
+                [     ref x @ .., '*'] if !x.contains(&'*') => Condition::PartContains{part: UrlPart::PathSegment(i as isize), r#where: StringLocation::Start, value:      x.iter().collect::<String>().into()} ,
+                      ref x            if !x.contains(&'*') => Condition::PartIs      {part: UrlPart::PathSegment(i as isize),                                 value: Some(x.iter().collect::<String>().into())},
                 _ => todo!()
             }).collect::<Vec<_>>())
         }
@@ -162,7 +162,7 @@ fn main() -> Result<(), AdGuardError> {
         $")
         .multi_line(true).ignore_whitespace(true).build()?;
 
-    let mut rules=Vec::<Rule>::new();
+    let mut rules=Rules(Vec::new());
 
     for line in BufReader::new(File::open("rules.txt")?).lines() {
         let line = line?;
@@ -178,19 +178,54 @@ fn main() -> Result<(), AdGuardError> {
                 println!("-- {line}");
                 println!("TODO: Negated rules.");
             } else if let Some(removeparam) = removeparam {
-                let rule = simplify_rule(Rule::Normal {
-                    condition: Condition::All(vec![Some(Condition::Any(vec![host, domains].into_iter().filter_map(|x| x).collect())), path, query].into_iter().filter_map(|x| x).collect()),
+                rules.0.push(Rule::Normal {
+                    condition: Condition::All(vec![
+                        Some(Condition::Any(vec![
+                            if host.is_none() && domains.is_none() {Some(Condition::Always)} else {None},
+                            host,
+                            domains
+                        ].into_iter().flatten().collect())),
+                        path,
+                        query
+                    ].into_iter().flatten().collect()),
                     mapper: removeparam
                 });
-                println!("-- {line}");
-                println!("{}", serde_json::to_string_pretty(&rule).unwrap());
             }
         } else if !line.starts_with('!') {
             eprintln!("Non-comment line not parsed: {line}");
         }
     }
 
+    let rules = simplify_rules(rules);
+
+    println!("{}", serde_json::to_string_pretty(&rules).unwrap());
+
     Ok(())
+}
+
+fn simplify_rules(rules: Rules) -> Rules {
+    let mut ret = Vec::new();
+
+    for rule in rules.0.into_iter().map(simplify_rule) {
+        if let Some(last_rule) = ret.last_mut() {
+            match (last_rule, &rule) {
+                (Rule::Normal{condition: ref last_condition, mapper: ref mut last_mapper}, Rule::Normal{condition, mapper}) if last_condition == condition => {
+                    match (last_mapper, mapper) {
+                        (Mapper::RemoveQueryParams(ref mut last_params), Mapper::RemoveQueryParams(params)) => {
+                            last_params.extend(params.clone());
+                            continue;
+                        },
+                        _ => {}
+                    }
+                },
+                _ => {}
+            }
+        }
+        if !matches!(rule, Rule::Normal{condition: Condition::Never, ..}) {
+            ret.push(rule);
+        }
+    }
+    Rules(ret)
 }
 
 fn simplify_rule(rule: Rule) -> Rule {
@@ -202,29 +237,41 @@ fn simplify_rule(rule: Rule) -> Rule {
 
 fn simplify_condition(condition: Condition) -> Condition {
     match condition {
-        Condition::Any(subconditions) if subconditions.len() == 0 => Condition::Never,
-        Condition::Any(subconditions) if subconditions.len() == 1 => simplify_condition(subconditions.get(0).unwrap().clone()), // `subconditions[0]` doesn't work (probably fixed by Polonious)
         Condition::Any(subconditions) => {
-            let mut ret = Vec::new();
-            for subcondition in subconditions {
-                match simplify_condition(subcondition) {
-                    Condition::Any(subsubconditions) => {ret.extend(subsubconditions)},
-                    subcondition => {ret.push(subcondition)}
+            let subconditions = subconditions.into_iter().filter_map(|x| {let ret = simplify_condition(x); if ret != Condition::Never {Some(ret)} else {None}}).collect::<Vec<_>>();
+            match subconditions.len() {
+                0 => Condition::Never,
+                1 => simplify_condition(subconditions.get(0).unwrap().clone()),
+                _ => {
+                    let mut ret = Vec::new();
+                    for subcondition in subconditions {
+                        match simplify_condition(subcondition) {
+                            Condition::Always => return Condition::Always,
+                            Condition::Any(subsubconditions) => {ret.extend(subsubconditions)},
+                            subsubcondition => {ret.push(subsubcondition)}
+                        }
+                    }
+                    Condition::Any(ret)
                 }
             }
-            Condition::Any(ret)
         },
-        Condition::All(subconditions) if subconditions.len() == 0 => Condition::Always,
-        Condition::All(subconditions) if subconditions.len() == 1 => simplify_condition(subconditions.get(0).unwrap().clone()), // `subconditions[0]` doesn't work (probably fixed by Polonious)
         Condition::All(subconditions) => {
-            let mut ret = Vec::new();
-            for subcondition in subconditions {
-                match simplify_condition(subcondition) {
-                    Condition::All(subsubconditions) => {ret.extend(subsubconditions)},
-                    subcondition => {ret.push(subcondition)}
+            let subconditions = subconditions.into_iter().filter_map(|x| {let ret = simplify_condition(x); if ret != Condition::Always {Some(ret)} else {None}}).collect::<Vec<_>>();
+            match subconditions.len() {
+                0 => Condition::Always,
+                1 => simplify_condition(subconditions.get(0).unwrap().clone()),
+                _ => {
+                    let mut ret = Vec::new();
+                    for subcondition in subconditions {
+                        match simplify_condition(subcondition) {
+                            Condition::Never => return Condition::Never,
+                            Condition::All(subsubconditions) => {ret.extend(subsubconditions)},
+                            subsubcondition => {ret.push(subsubcondition)}
+                        }
+                    }
+                    Condition::All(ret)
                 }
             }
-            Condition::All(ret)
         },
         _ => condition
     }
