@@ -36,7 +36,9 @@ enum RemoveParam {
 #[derive(Debug, Error)]
 enum ParseRemoveParamError {
     #[error(transparent)]
-    RegexSyntaxError(#[from] Box<regex_syntax::Error>)
+    RegexSyntaxError(#[from] Box<regex_syntax::Error>),
+    #[error(transparent)]
+    USERPError(#[from] UDERPError)
 }
 
 impl FromStr for RemoveParam {
@@ -45,7 +47,8 @@ impl FromStr for RemoveParam {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(if s.starts_with('/') {
             Self::RegexParts(RegexParts::new_with_config(
-                s.split_once('/').unwrap().1.rsplit_once('/').unwrap().0,
+                &un_double_escape_regex_pattern(s.split_once('/').unwrap().1.rsplit_once('/').unwrap().0)?,
+                // s.split_once('/').unwrap().1.rsplit_once('/').unwrap().0,
                 {let mut config = RegexConfig::default(); config.add_flags(s.rsplit_once('/').unwrap().1); config}
             )?)
         } else {
@@ -54,8 +57,44 @@ impl FromStr for RemoveParam {
     }
 }
 
-fn domain_glob_to_condition(unqualified: bool, domain: &str) -> Condition {
-    match (unqualified, &domain.split('.').collect::<Vec<_>>()[..]) {
+impl TryFrom<RemoveParam> for Mapper {
+    type Error = <RegexParts as TryInto<RegexWrapper>>::Error;
+    
+    fn try_from(value: RemoveParam) -> Result<Self, <Self as TryFrom<RemoveParam>>::Error> {
+        Ok(match value {
+            RemoveParam::RegexParts(regex_parts) => Self::RemoveQueryParamsMatching(StringMatcher::Regex(regex_parts.try_into()?)),
+            RemoveParam::String(string) => Self::RemoveQueryParams([string].into_iter().collect())
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+enum UDERPError {
+    #[error("UnknownEscape")]
+    UnknownEscape
+}
+
+fn un_double_escape_regex_pattern(pattern: &str) -> Result<String, UDERPError> {
+    let mut ret = String::new();
+    let mut escape = false;
+
+    for c in pattern.chars() {
+        if let Some(to_push) = match (escape, c) {
+            (false, '\\') => {escape = true ; None      },
+            (true , '\\') => {escape = false; Some('\\')},
+            (true , '/' ) => {escape = false; Some('/' )},
+            (true , ',' ) => {escape = false; Some(',' )},
+            (true , _   ) => {None},// Err(UDERPError::UnknownEscape)?,
+            (false, _   ) => Some(c)
+        } {
+            ret.push(to_push);
+        }
+    }
+    Ok(ret)
+}
+
+fn domain_glob_to_condition(explicitly_unqualified: bool, domain: &str) -> Condition {
+    match (explicitly_unqualified, &domain.split('.').collect::<Vec<_>>()[..]) {
         (_    , ["*", ref segments @ .., "*"]) | (true, [ref segments @ .., "*"]) if !segments.contains(&"*") => Condition::UnqualifiedAnyTld(domain.to_string()),
         (false, [     ref segments @ .., "*"]) | (true, [ref segments @ ..     ]) if !segments.contains(&"*") => Condition::QualifiedAnyTld  (domain.to_string()),
         (true ,       ref segments           )                                    if !segments.contains(&"*") => Condition::UnqualifiedDomain(domain.to_string()),
@@ -78,6 +117,28 @@ fn path_glob_to_condition(path: &str) -> Condition {
             }).collect::<Vec<_>>())
         }
     }
+}
+
+#[derive(Debug, Error)]
+enum QueryToConditionError {
+    #[error(transparent)]
+    RegexMakingError(#[from] Box<regex_syntax::Error>)
+}
+
+fn query_to_condition(query: &str) -> Result<Condition, QueryToConditionError> {
+    Ok(Condition::All(query.split('&').map(|param| Ok(match param.split_once('=') {
+        None => Condition::Not(Box::new(Condition::PartIs{part: UrlPart::QueryParam(param.to_string()), value: None})),
+        Some((k, v)) => match (k, v) {
+            (k,  v ) if !k.contains('*') && !v.contains('*') => Condition::PartIs{part: UrlPart::QueryParam(k.to_string()), value: Some(v.into())},
+            (k, "*") if !k.contains('*')                     => Condition::Not(Box::new(Condition::PartIs{part: UrlPart::QueryParam(k.to_string()), value: None})),
+            (k,  v ) if !k.contains('*')                     => Condition::PartMatches{part: UrlPart::QueryParam(k.to_string()), matcher: StringMatcher::Regex(RegexWrapper::from_str(&v.replace('*', ".*"))?)},
+            _ => todo!()
+        }
+    })).collect::<Result<_, QueryToConditionError>>()?))
+}
+
+fn domains_to_condition(domains: &str) -> Condition {
+    Condition::All(domains.split('|').map(|domain| domain_glob_to_condition(false, domain)).collect())
 }
 
 #[derive(Debug, Error)]
@@ -108,17 +169,11 @@ fn main() -> Result<(), AdGuardError> {
         if let Some(rule) = rule_parser.captures(&line) {
             let negation    = rule.name("negation"   ).is_some();
             let unqualified = rule.name("unqualified").is_some();
-            let host        = rule.name("host"       ).map(|host   | host   .as_str());
-            let path        = rule.name("path"       ).map(|path   | path   .as_str());
-            let query       = rule.name("query"      ).map(|query  | query  .as_str());
-            let removeparam = rule.name("removeparam").map(|query  | query  .as_str());
-            let domains     = rule.name("domains"    ).map(|domains| domains.as_str());
-            println!("{line}");
-            println!("{negation:?} {unqualified:?} {host:?} {path:?} {query:?} {removeparam:?} {domains:?}");
-            if let Some(host) = host {println!("-- {:?}", domain_glob_to_condition(unqualified, host));}
-            if let Some(path) = path {println!("-- {:?}", path_glob_to_condition(path));}
-            if let Some(removeparam) = removeparam {println!("-- {:?}", RemoveParam::from_str(removeparam));}
-            println!();
+            let host        = rule.name("host"       ).map(|host   | domain_glob_to_condition(unqualified, host.as_str())));
+            let path        = rule.name("path"       ).map(|path   | path_glob_to_condition  (path   .as_str())));
+            let query       = rule.name("query"      ).map(|query  | query_to_condition      (query  .as_str())));
+            let removeparam = rule.name("removeparam").map(|query  | Mapper::try_from(RemoveParam::from_str(query.as_str()).unwrap()).unwrap()));
+            let domains     = rule.name("domains"    ).map(|domains| domains_to_condition    (domains.as_str())));
         } else if !line.starts_with('!') {
             eprintln!("Non-comment line not parsed: {line}");
         }
