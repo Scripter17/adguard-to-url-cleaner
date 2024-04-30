@@ -95,10 +95,10 @@ fn un_double_escape_regex_pattern(pattern: &str) -> Result<String, UDERPError> {
 
 fn domain_glob_to_condition(explicitly_unqualified: bool, domain: &str) -> Condition {
     match (explicitly_unqualified, &domain.split('.').collect::<Vec<_>>()[..]) {
-        (_    , ["*", ref segments @ .., "*"]) | (true, [ref segments @ .., "*"]) if !segments.contains(&"*") => Condition::UnqualifiedAnyTld(domain.to_string()),
-        (false, [     ref segments @ .., "*"]) | (true, [ref segments @ ..     ]) if !segments.contains(&"*") => Condition::QualifiedAnyTld  (domain.to_string()),
-        (true ,       ref segments           )                                    if !segments.contains(&"*") => Condition::UnqualifiedDomain(domain.to_string()),
-        (false,       ref segments           )                                    if !segments.contains(&"*") => Condition::QualifiedDomain  (domain.to_string()),
+        (_    , ["*", ref segments @ .., "*"]) | (true , [ref segments @ .., "*"]) if !segments.contains(&"*") => Condition::UnqualifiedAnyTld(domain.strip_suffix(".*").unwrap().to_string()),
+        (false, [     ref segments @ .., "*"])                                     if !segments.contains(&"*") => Condition::QualifiedAnyTld  (domain.strip_suffix(".*").unwrap().to_string()),
+        (true ,       ref segments           )                                     if !segments.contains(&"*") => Condition::UnqualifiedDomain(domain.to_string()),
+        (false,       ref segments           )                                     if !segments.contains(&"*") => Condition::QualifiedDomain  (domain.to_string()),
         _ => todo!()
     }
 }
@@ -138,7 +138,7 @@ fn query_to_condition(query: &str) -> Result<Condition, QueryToConditionError> {
 }
 
 fn domains_to_condition(domains: &str) -> Condition {
-    Condition::All(domains.split('|').map(|domain| domain_glob_to_condition(false, domain)).collect())
+    Condition::Any(domains.split('|').map(|domain| domain_glob_to_condition(true, domain)).collect())
 }
 
 #[derive(Debug, Error)]
@@ -169,15 +169,67 @@ fn main() -> Result<(), AdGuardError> {
         if let Some(rule) = rule_parser.captures(&line) {
             let negation    = rule.name("negation"   ).is_some();
             let unqualified = rule.name("unqualified").is_some();
-            let host        = rule.name("host"       ).map(|host   | domain_glob_to_condition(unqualified, host.as_str())));
-            let path        = rule.name("path"       ).map(|path   | path_glob_to_condition  (path   .as_str())));
-            let query       = rule.name("query"      ).map(|query  | query_to_condition      (query  .as_str())));
-            let removeparam = rule.name("removeparam").map(|query  | Mapper::try_from(RemoveParam::from_str(query.as_str()).unwrap()).unwrap()));
-            let domains     = rule.name("domains"    ).map(|domains| domains_to_condition    (domains.as_str())));
+            let host        = rule.name("host"       ).map(|host   | domain_glob_to_condition(unqualified, host.as_str()));
+            let path        = rule.name("path"       ).map(|path   | path_glob_to_condition  (path   .as_str()));
+            let query       = rule.name("query"      ).map(|query  | query_to_condition      (query  .as_str()).unwrap());
+            let removeparam = rule.name("removeparam").map(|query  | Mapper::try_from(RemoveParam::from_str(query.as_str()).unwrap()).unwrap());
+            let domains     = rule.name("domains"    ).map(|domains| domains_to_condition    (domains.as_str()));
+            if negation {
+                println!("-- {line}");
+                println!("TODO: Negated rules.");
+            } else if let Some(removeparam) = removeparam {
+                let rule = simplify_rule(Rule::Normal {
+                    condition: Condition::All(vec![Some(Condition::Any(vec![host, domains].into_iter().filter_map(|x| x).collect())), path, query].into_iter().filter_map(|x| x).collect()),
+                    mapper: removeparam
+                });
+                println!("-- {line}");
+                println!("{}", serde_json::to_string_pretty(&rule).unwrap());
+            }
         } else if !line.starts_with('!') {
             eprintln!("Non-comment line not parsed: {line}");
         }
     }
 
     Ok(())
+}
+
+fn simplify_rule(rule: Rule) -> Rule {
+    match rule {
+        Rule::Normal{condition, mapper} => Rule::Normal {condition: simplify_condition(condition), mapper: simplify_mapper(mapper)},
+        _ => rule
+    }
+}
+
+fn simplify_condition(condition: Condition) -> Condition {
+    match condition {
+        Condition::Any(subconditions) if subconditions.len() == 0 => Condition::Never,
+        Condition::Any(subconditions) if subconditions.len() == 1 => simplify_condition(subconditions.get(0).unwrap().clone()), // `subconditions[0]` doesn't work (probably fixed by Polonious)
+        Condition::Any(subconditions) => {
+            let mut ret = Vec::new();
+            for subcondition in subconditions {
+                match simplify_condition(subcondition) {
+                    Condition::Any(subsubconditions) => {ret.extend(subsubconditions)},
+                    subcondition => {ret.push(subcondition)}
+                }
+            }
+            Condition::Any(ret)
+        },
+        Condition::All(subconditions) if subconditions.len() == 0 => Condition::Always,
+        Condition::All(subconditions) if subconditions.len() == 1 => simplify_condition(subconditions.get(0).unwrap().clone()), // `subconditions[0]` doesn't work (probably fixed by Polonious)
+        Condition::All(subconditions) => {
+            let mut ret = Vec::new();
+            for subcondition in subconditions {
+                match simplify_condition(subcondition) {
+                    Condition::All(subsubconditions) => {ret.extend(subsubconditions)},
+                    subcondition => {ret.push(subcondition)}
+                }
+            }
+            Condition::All(ret)
+        },
+        _ => condition
+    }
+}
+
+fn simplify_mapper(mapper: Mapper) -> Mapper {
+    mapper
 }

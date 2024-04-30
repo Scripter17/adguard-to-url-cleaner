@@ -8,5 +8,6 @@ edition = "2021"
 [dependencies]
 regex = "1.10.4"
 regex-syntax = "0.8.3"
+serde_json = "1.0.116"
 thiserror = "1.0.59"
 url-cleaner = { path = "../url-cleaner" }
